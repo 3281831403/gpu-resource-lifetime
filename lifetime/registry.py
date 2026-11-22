@@ -100,6 +100,29 @@ __all__ = [
 ]
 
 
+def _init(registry: dict) -> None:
+    """Initialise any missing registry key on first use."""
+    registry.setdefault("frame", 0)
+    registry.setdefault("next_slot", 0)
+    registry.setdefault("free_slots", [])
+    registry.setdefault("generations", {})
+    registry.setdefault("resources", {})
+    registry.setdefault("pending_free", {})
+
+
+def _lookup(registry: dict, handle: int) -> dict:
+    """Return the live record for ``handle`` or raise ``KeyError``.
+
+    The slot must exist in the live table and the stored handle must match
+    exactly; a handle whose slot was recycled at a newer generation is stale.
+    """
+    slot = handle & SLOT_MASK
+    record = registry["resources"].get(slot)
+    if record is None or record["handle"] != handle:
+        raise KeyError(handle)
+    return record
+
+
 def create(registry: dict, desc: str) -> dict:
     """Allocate a new resource described by ``desc`` and return its record.
 
@@ -119,7 +142,27 @@ def create(registry: dict, desc: str) -> dict:
       bumped by exactly one per allocation of that slot, and the reference
       count starts at exactly one.
     """
-    raise NotImplementedError("lifetime.registry.create is not implemented")
+    _init(registry)
+    if registry["free_slots"]:
+        slot = registry["free_slots"].pop()
+    else:
+        slot = registry["next_slot"]
+        registry["next_slot"] = slot + 1
+    generation = registry["generations"].get(slot, 0) + 1
+    registry["generations"][slot] = generation
+    handle = (generation << SLOT_BITS) | slot
+    record = {
+        "handle": handle,
+        "desc": desc,
+        "refcount": 1,
+        "created_frame": registry["frame"],
+        "last_used_frame": registry["frame"],
+        "edges": [],
+        "released_frame": None,
+        "deadline": None,
+    }
+    registry["resources"][slot] = record
+    return dict(record)
 
 
 def retain(registry: dict, handle: int, frame: int) -> dict:
@@ -143,7 +186,15 @@ def retain(registry: dict, handle: int, frame: int) -> dict:
       current frame); it is never inferred from a clock.  Return a snapshot
       of the updated record.
     """
-    raise NotImplementedError("lifetime.registry.retain is not implemented")
+    _init(registry)
+    record = _lookup(registry, handle)
+    record["refcount"] += 1
+    record["last_used_frame"] = frame
+    if handle in registry["pending_free"]:
+        del registry["pending_free"][handle]
+        record["released_frame"] = None
+        record["deadline"] = None
+    return dict(record)
 
 
 def release(registry: dict, handle: int, frame: int) -> dict:
@@ -169,7 +220,18 @@ def release(registry: dict, handle: int, frame: int) -> dict:
     * ``frame`` must be at least ``registry["frame"]`` (the caller passes the
       current frame); it is never inferred from a clock.
     """
-    raise NotImplementedError("lifetime.registry.release is not implemented")
+    _init(registry)
+    record = _lookup(registry, handle)
+    if record["refcount"] == 0:
+        # Double release is suppressed: the count never goes negative and
+        # the parked record keeps its original release frame and deadline.
+        return dict(record)
+    record["refcount"] -= 1
+    if record["refcount"] == 0:
+        record["released_frame"] = frame
+        record["deadline"] = frame + RELEASE_DELAY_FRAMES
+        registry["pending_free"][handle] = record["deadline"]
+    return dict(record)
 
 
 def tick(registry: dict, frame: int) -> dict:
@@ -195,7 +257,26 @@ def tick(registry: dict, frame: int) -> dict:
       is a no-op.  Tolerance is zero: one tick releases all expired entries,
       and only those.
     """
-    raise NotImplementedError("lifetime.registry.tick is not implemented")
+    _init(registry)
+    if frame < registry["frame"]:
+        raise ValueError(f"frame went backwards: {frame} < {registry['frame']}")
+    registry["frame"] = frame
+    expired = [
+        handle
+        for handle, deadline in registry["pending_free"].items()
+        if deadline < frame
+    ]
+    released = []
+    for handle in expired:
+        slot = handle & SLOT_MASK
+        record = registry["resources"].get(slot)
+        if record is not None and record["handle"] == handle:
+            del registry["resources"][slot]
+            registry["free_slots"].append(slot)
+        del registry["pending_free"][handle]
+        released.append(handle)
+    released.sort()
+    return {"frame": frame, "released": released}
 
 
 def reuse_conflict(registry: dict, handle: int) -> bool:
@@ -214,7 +295,10 @@ def reuse_conflict(registry: dict, handle: int) -> bool:
       must not be fooled into comparing just the slot number, because every
       recycled slot keeps its id.
     """
-    raise NotImplementedError("lifetime.registry.reuse_conflict is not implemented")
+    _init(registry)
+    slot = handle & SLOT_MASK
+    generation = handle >> SLOT_BITS
+    return registry["generations"].get(slot, 0) > generation
 
 
 def leak_report(registry: dict) -> list[str]:
@@ -239,7 +323,22 @@ def leak_report(registry: dict) -> list[str]:
       resource's ``desc`` and its decimal ``handle`` so a caller can act on
       it.  Return ``[]`` for a clean registry.
     """
-    raise NotImplementedError("lifetime.registry.leak_report is not implemented")
+    _init(registry)
+    frame = registry["frame"]
+    pending = registry["pending_free"]
+    leaked = []
+    for slot, record in registry["resources"].items():
+        handle = record["handle"]
+        if record["refcount"] > 0:
+            if frame - record["last_used_frame"] > LEAK_AFTER_FRAMES:
+                leaked.append(record)
+        elif handle not in pending:
+            leaked.append(record)
+    leaked.sort(key=lambda record: record["handle"])
+    return [
+        f"leaked resource {record['desc']!r} (handle {record['handle']})"
+        for record in leaked
+    ]
 
 
 def cycle_detect(registry: dict) -> list[list[str]]:
@@ -259,7 +358,43 @@ def cycle_detect(registry: dict) -> list[list[str]]:
       acyclic.  The result is deterministic: no duplicates and no dependence
       on dict insertion order.
     """
-    raise NotImplementedError("lifetime.registry.cycle_detect is not implemented")
+    _init(registry)
+    resources = registry["resources"]
+    # Map live handles to their slot so edges to reclaimed/unknown handles
+    # are ignored.
+    live_slots_by_handle = {
+        record["handle"]: slot for slot, record in resources.items()
+    }
+    adjacency: dict[int, list[int]] = {}
+    for slot, record in resources.items():
+        targets = []
+        for edge in record["edges"]:
+            target = live_slots_by_handle.get(edge)
+            if target is not None and target not in targets:
+                targets.append(target)
+        adjacency[slot] = sorted(targets)
+
+    nodes = sorted(resources)
+    rank = {slot: index for index, slot in enumerate(nodes)}
+    cycles: set[tuple[str, ...]] = set()
+
+    # Enumerate simple cycles: start from each node and only visit nodes
+    # whose rank is >= the start's, so every cycle is found exactly once
+    # (from its lowest-ranked member).
+    for start in nodes:
+        stack: list[tuple[int, list[int]]] = [(start, [start])]
+        while stack:
+            node, path = stack.pop()
+            for nxt in adjacency[node]:
+                if nxt == start:
+                    descs = [resources[s]["desc"] for s in path]
+                    pivot = descs.index(min(descs))
+                    rotated = tuple(descs[pivot:] + descs[:pivot])
+                    cycles.add(rotated)
+                elif rank[nxt] > rank[start] and nxt not in path:
+                    stack.append((nxt, path + [nxt]))
+
+    return [list(cycle) for cycle in sorted(cycles)]
 
 
 def validate_registry(registry: dict) -> list[str]:
@@ -285,4 +420,54 @@ def validate_registry(registry: dict) -> list[str]:
       decimal.  Return ``[]`` for a consistent registry; this function never
       mutates the registry.
     """
-    raise NotImplementedError("lifetime.registry.validate_registry is not implemented")
+    _init(registry)
+    problems: list[str] = []
+    resources = registry["resources"]
+    generations = registry["generations"]
+    pending = registry["pending_free"]
+
+    for slot, record in resources.items():
+        refcount = record["refcount"]
+        if not isinstance(refcount, int) or isinstance(refcount, bool) or refcount < 0:
+            problems.append(f"slot {slot}: invalid refcount {refcount!r}")
+        handle = record["handle"]
+        if (handle & SLOT_MASK) != slot:
+            problems.append(
+                f"slot {slot}: handle {handle} decodes to a different slot"
+            )
+        generation = handle >> SLOT_BITS
+        if generation < 1 or generations.get(slot) != generation:
+            problems.append(
+                f"slot {slot}: handle {handle} generation {generation} does not "
+                f"match recorded generation {generations.get(slot)}"
+            )
+        if refcount == 0 and handle not in pending:
+            problems.append(
+                f"slot {slot}: handle {handle} has zero references but is not "
+                f"in the delayed-free queue (stuck entry)"
+            )
+
+    for handle, deadline in pending.items():
+        slot = handle & SLOT_MASK
+        record = resources.get(slot)
+        if record is None or record["handle"] != handle:
+            problems.append(
+                f"pending_free handle {handle}: no live record (dangling queue entry)"
+            )
+            continue
+        if record["refcount"] != 0:
+            problems.append(
+                f"pending_free handle {handle}: live record has refcount "
+                f"{record['refcount']} instead of 0"
+            )
+        if record["released_frame"] is None:
+            problems.append(
+                f"pending_free handle {handle}: live record has no released_frame"
+            )
+        elif deadline != record["released_frame"] + RELEASE_DELAY_FRAMES:
+            problems.append(
+                f"pending_free handle {handle}: deadline {deadline} does not equal "
+                f"released_frame {record['released_frame']} + {RELEASE_DELAY_FRAMES}"
+            )
+
+    return problems
